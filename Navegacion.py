@@ -1,14 +1,17 @@
 import math
 import asyncio
 import heapq
+# --- ¡NUEVA LIBRERÍA! ---
+import speech_recognition as sr
+
 from irobot_edu_sdk.backend.bluetooth import Bluetooth
 from irobot_edu_sdk.robots import Create3, event
 from irobot_edu_sdk.music import Note
 
 # ---------------- CONFIGURACIÓN Y CONSTANTES ----------------
 k_att = 1.0
-k_rep = 1500.0
-d0 = 50.0
+k_rep = 3000.0
+d0 = 80.0
 k_tangent = 0.5
 v_crucero = 30.0
 v_minima = 8.0
@@ -16,11 +19,12 @@ t_rampa = 5.0
 tolerancia = 10.0
 dt = 0.1
 radio_giro_minimo = 20.0
-factor_suavizado_giro = 2.0
+factor_suavizado_giro = 0.8
 tiempo_chequeo = 3.0
 umbral_progreso = 5.0
 max_intentos_minimo = 3
 RADIO_PUNTO_INTERMEDIO = 15.0
+UMBRAL_FRENTE_MINIMO = 25.0
 
 robot = Create3(Bluetooth("C3_UIEC_Grupo2"))
 
@@ -33,15 +37,46 @@ PUNTOS_INTERES = {
     "Punto Columnas": (-78.20, -333.70, 101.30),
     "Garaje": (-304.50, -85.40, 13.50),
     "Escaleras 1": (-298.80, -578.00, 178.50),
-    "Pasillo Inicio": (324.00, -133.80, -19.20),
+    "Pasillo Inicio": (324.00, -153.80, -19.20),
     "Entrada": (883.10, -503.20, 257.10),
     "Ascensores": (211.90, -477.70, 172.60),
     "Administración": (347.90, 269.60, 93.90),
     "Sala 06": (343.10, 1645.80, 1.90),
-    "Punto Pousa": (314.10, 2235.70, 3.00),
-    "Pousa": (198.90, 2268.70, 74.40),
+    "Punto Pousa": (334.10, 2255.70, 3.00),
+    "Pousa": (218.90, 2268.70, 74.40),
     "Escaleras 2": (335.60, 2547.80, 12.60),
     "Estación Carga": (-350.00, -50.00, 0.00)
+}
+
+# --- ¡NUEVO DICCIONARIO PARA COMANDOS DE VOZ! ---
+# Mapea palabras habladas a los nombres de los destinos.
+ALIAS_DESTINOS = {
+    "despacho y baños": "Despacho y Baños",
+    "baños": "Despacho y Baños",
+    "baño": "Despacho y Baños",
+    "despacho": "Despacho y Baños",
+    "columnas": "Punto Columnas",
+    "punto columnas": "Punto Columnas",
+    "garaje": "Garaje",
+    "escaleras uno": "Escaleras 1",
+    "primeras escaleras": "Escaleras 1",
+    "pasillo": "Pasillo Inicio",
+    "inicio del pasillo": "Pasillo Inicio",
+    "entrada": "Entrada",
+    "ascensores": "Ascensores",
+    "ascensor": "Ascensores",
+    "administración": "Administración",
+    "sala 6": "Sala 06",
+    "sala seis": "Sala 06",
+    "punto pousa": "Punto Pousa",
+    "pousa": "Pousa",
+    "escaleras dos": "Escaleras 2",
+    "segundas escaleras": "Escaleras 2",
+    "cargar": "Estación Carga",
+    "estación de carga": "Estación Carga",
+    "terminar": "SALIR",
+    "salir": "SALIR",
+    "para": "SALIR"
 }
 
 # --- GRAFO DE ADYACENCIA ---
@@ -61,12 +96,49 @@ GRAFO = {
     "Escaleras 2": ["Punto Pousa"]
 }
 
+
 # ---------------- FUNCIONES ----------------
 
+# --- ¡NUEVA FUNCIÓN DE VOZ! ---
+def _escuchar_y_procesar_comando():
+    """Función síncrona que bloquea para escuchar y procesar un comando de voz."""
+    r = sr.Recognizer()
+    with sr.Microphone() as source:
+        print("\n🎤 Ajustando ruido ambiental... Espera.")
+        r.adjust_for_ambient_noise(source, duration=1)
+        print("✅ ¡Listo! Di a dónde quieres ir (ej: 've al garaje')...")
+        try:
+            audio = r.listen(source, timeout=5, phrase_time_limit=8)
+            print("🧠 Procesando tu voz...")
+            texto = r.recognize_google(audio, language='es-ES')
+            print(f"🗣 Has dicho: '{texto}'")
+
+            texto_lower = texto.lower()
+            for alias, destino_real in ALIAS_DESTINOS.items():
+                if alias in texto_lower:
+                    print(f"🎯 Destino reconocido: '{destino_real}'")
+                    return destino_real
+
+            print("❓ No he reconocido un destino válido en tu comando.")
+            return None
+
+        except sr.WaitTimeoutError:
+            print("🔇 No he detectado ninguna voz.")
+            return None
+        except sr.UnknownValueError:
+            print("🤔 No he podido entender lo que has dicho. ¿Puedes repetirlo?")
+            return None
+        except sr.RequestError as e:
+            print(f"API Error: No se pudo conectar con el servicio de reconocimiento; {e}")
+            return None
+
+
+# (El resto de funciones de navegación no necesitan cambios)
 def calcular_distancia(p1_nombre, p2_nombre):
     x1, y1, _ = PUNTOS_INTERES[p1_nombre]
     x2, y2, _ = PUNTOS_INTERES[p2_nombre]
     return math.hypot(x2 - x1, y2 - y1)
+
 
 def dijkstra(grafo, punto_inicio, punto_final):
     cola_prioridad = [(0, punto_inicio, [punto_inicio])]
@@ -85,22 +157,26 @@ def dijkstra(grafo, punto_inicio, punto_final):
                 heapq.heappush(cola_prioridad, (distancia_nueva, vecino, camino_nuevo))
     return None
 
+
 def distancia_sensor(valor):
     try:
         return 632.19 / valor + 5.97 if valor > 0 else 999
     except Exception:
         return 999
 
+
 async def get_pos(robot):
     pos = await robot.get_position()
     if pos is None: return None, None, None
     return pos.x, pos.y, pos.heading
+
 
 def fuerza_atractiva(x, y):
     dx, dy = x_goal - x, y_goal - y
     dist = math.hypot(dx, dy)
     if dist > 0: return (k_att * dx / dist, k_att * dy / dist)
     return (0, 0)
+
 
 def fuerza_repulsiva(x, y, dist_ir, heading):
     Fx, Fy = 0, 0
@@ -116,18 +192,21 @@ def fuerza_repulsiva(x, y, dist_ir, heading):
             Fx += Fx_norm - (Fy_norm * k_tangent)
             Fy += Fy_norm + (Fx_norm * k_tangent)
     mag_rep = math.hypot(Fx, Fy)
-    if mag_rep > 15.0: Fx, Fy = (Fx / mag_rep) * 15.0, (Fy / mag_rep) * 15.0
+    if mag_rep > 20.0: Fx, Fy = (Fx / mag_rep) * 20.0, (Fy / mag_rep) * 20.0
     return Fx, Fy
+
 
 def rampa_aceleracion(t, v_crucero, t_rampa):
     if t < t_rampa: return v_crucero * (t / t_rampa)
     return v_crucero
 
-def freno_suave(distancia_obj, distancia_meta, v_actual, min_dist_obj=40, rango_meta=50):
+
+def freno_suave(distancia_obj, distancia_meta, v_actual, min_dist_obj=70, rango_meta=50):
     v_frenada = v_actual
     if distancia_obj < min_dist_obj: v_frenada = v_actual * max(0.1, distancia_obj / min_dist_obj)
     if distancia_meta < rango_meta: v_frenada = min(v_frenada, v_actual * max(0.2, distancia_meta / rango_meta))
     return v_frenada
+
 
 def calcular_velocidades_ackermann(v_base, error_angular):
     v_efectiva = max(v_base, v_minima)
@@ -145,16 +224,20 @@ def calcular_velocidades_ackermann(v_base, error_angular):
     if v_right < velocidad_minima_rueda: v_right = velocidad_minima_rueda
     return min(v_left, v_crucero), min(v_right, v_crucero)
 
+
 async def escape_minimo_local_ackermann(robot, direccion='izquierda'):
     print(f" ESCAPE DE MÍNIMO LOCAL - Girando a la {direccion}")
     v_left, v_right = (8, 20) if direccion == 'izquierda' else (20, 8)
     for _ in range(int(2.0 / dt)):
         await robot.set_wheel_speeds(v_left, v_right)
         await asyncio.sleep(dt)
-    await robot.set_wheel_speeds(20, 20); await asyncio.sleep(1.0)
-    await robot.set_wheel_speeds(0, 0); print(" Escape completado"); await asyncio.sleep(0.5)
+    await robot.set_wheel_speeds(20, 20);
+    await asyncio.sleep(1.0)
+    await robot.set_wheel_speeds(0, 0);
+    print(" Escape completado");
+    await asyncio.sleep(0.5)
 
-# --- FUNCIÓN DE NAVEGACIÓN (CORREGIDA) ---
+
 async def recorrer_camino_suave(robot, camino, punto_partida):
     global x_goal, y_goal
     if not camino or len(camino) < 2: return False, punto_partida
@@ -171,39 +254,40 @@ async def recorrer_camino_suave(robot, camino, punto_partida):
         x_goal, y_goal = PUNTOS_INTERES[waypoint_objetivo_nombre][:2]
         x, y, heading = await get_pos(robot)
         if x is None:
-            await robot.set_wheel_speeds(0, 0); return False, punto_actual_nombre
+            await robot.set_wheel_speeds(0, 0);
+            return False, punto_actual_nombre
         dist_meta = math.hypot(x_goal - x, y_goal - y)
         es_ultimo_waypoint = (indice_waypoint_objetivo == len(camino) - 1)
         radio_deteccion = tolerancia if es_ultimo_waypoint else RADIO_PUNTO_INTERMEDIO
         if dist_meta < radio_deteccion:
             punto_actual_nombre = waypoint_objetivo_nombre
             if es_ultimo_waypoint:
-                # --- ¡CORRECCIÓN AQUÍ! ---
-                # Detenemos el robot explícitamente al llegar al destino final.
                 await robot.set_wheel_speeds(0, 0)
                 return True, punto_actual_nombre
             else:
                 print(f"⚪ Pasando por *{punto_actual_nombre}*, continuando...")
                 indice_waypoint_objetivo += 1
-                dist_meta_anterior = None
-                tiempo_ultimo_chequeo = asyncio.get_event_loop().time()
+                dist_meta_anterior = None;
+                tiempo_ultimo_chequeo = asyncio.get_event_loop().time();
                 intentos_minimo = 0
                 continue
         prox = (await robot.get_ir_proximity()).sensors
         dist_frente = distancia_sensor(prox[3])
         tiempo_actual = asyncio.get_event_loop().time()
         if tiempo_actual - tiempo_ultimo_chequeo >= tiempo_chequeo:
-            if dist_meta_anterior is not None and (dist_meta_anterior - dist_meta) < umbral_progreso:
-                intentos_minimo += 1
-                await robot.set_wheel_speeds(0, 0); await asyncio.sleep(0.3)
-                await escape_minimo_local_ackermann(robot, 'izquierda' if intentos_minimo % 2 == 1 else 'derecha')
-                tiempo_inicio = tiempo_ultimo_chequeo = asyncio.get_event_loop().time()
-                dist_meta_anterior = ang_prev = None
-                if intentos_minimo >= max_intentos_minimo:
-                    return False, punto_actual_nombre
-                continue
-            else:
-                intentos_minimo = 0
+            if dist_meta_anterior is not None:
+                progreso = dist_meta_anterior - dist_meta
+                if progreso < umbral_progreso and dist_frente < UMBRAL_FRENTE_MINIMO:
+                    intentos_minimo += 1
+                    await robot.set_wheel_speeds(0, 0);
+                    await asyncio.sleep(0.3)
+                    await escape_minimo_local_ackermann(robot, 'izquierda' if intentos_minimo % 2 == 1 else 'derecha')
+                    tiempo_inicio = tiempo_ultimo_chequeo = asyncio.get_event_loop().time()
+                    dist_meta_anterior = ang_prev = None
+                    if intentos_minimo >= max_intentos_minimo: return False, punto_actual_nombre
+                    continue
+                else:
+                    intentos_minimo = 0
             dist_meta_anterior = dist_meta
             tiempo_ultimo_chequeo = tiempo_actual
         if dist_frente < 30 and not modo_evasion:
@@ -211,19 +295,23 @@ async def recorrer_camino_suave(robot, camino, punto_partida):
             tiempo_evasion = asyncio.get_event_loop().time()
         if modo_evasion:
             if asyncio.get_event_loop().time() - tiempo_evasion < 2.0:
-                izquierda = distancia_sensor(prox[1]); derecha = distancia_sensor(prox[5])
+                izquierda = distancia_sensor(prox[1]);
+                derecha = distancia_sensor(prox[5])
                 await robot.set_wheel_speeds(5, 20) if izquierda > derecha else await robot.set_wheel_speeds(20, 5)
             elif asyncio.get_event_loop().time() - tiempo_evasion < 3.0:
                 await robot.set_wheel_speeds(20, 20)
             else:
                 modo_evasion = False
-            await asyncio.sleep(dt); continue
+            await asyncio.sleep(dt);
+            continue
         Fx_att, Fy_att = fuerza_atractiva(x, y)
         Fx_rep, Fy_rep = fuerza_repulsiva(x, y, prox, heading)
         Fx_total, Fy_total = Fx_att + Fx_rep, Fy_att + Fy_rep
         ang_obj = math.degrees(math.atan2(Fy_total, Fx_total))
-        if ang_prev is None: ang_prev = ang_obj
-        else: ang_obj = 0.8 * ang_prev + 0.2 * ang_obj; ang_prev = ang_obj
+        if ang_prev is None:
+            ang_prev = ang_obj
+        else:
+            ang_obj = 0.6 * ang_prev + 0.4 * ang_obj; ang_prev = ang_obj
         t_actual = asyncio.get_event_loop().time() - tiempo_inicio
         v_target = freno_suave(dist_frente, dist_meta, rampa_aceleracion(t_actual, v_crucero, t_rampa))
         error_ang = (ang_obj - heading + 540) % 360 - 180
@@ -232,25 +320,16 @@ async def recorrer_camino_suave(robot, camino, punto_partida):
         await asyncio.sleep(dt)
     return False, punto_actual_nombre
 
-# ---------------- BUCLE PRINCIPAL Y MENÚ ----------------
-def mostrar_menu():
-    print("\n================ GUÍA DE LA UNIVERSIDAD ================")
-    opciones = [k for k in PUNTOS_INTERES.keys() if k != "Estación Carga"]
-    for i, nombre in enumerate(opciones): print(f" {i + 1}: {nombre}")
-    print(" 0: Salir")
-    while True:
-        try:
-            num_seleccion = int(input("\nElige tu destino (número): "))
-            if num_seleccion == 0: return None
-            elif 1 <= num_seleccion <= len(opciones): return opciones[num_seleccion - 1]
-            else: print("Opción no válida.")
-        except (ValueError, IndexError): print("Entrada no válida.")
 
+# --- ¡BUCLE PRINCIPAL MODIFICADO PARA USAR VOZ! ---
 async def iniciar_navegacion(robot):
     punto_actual = "Estación Carga"
     print(f"\n🤖 Iniciando en: {punto_actual}")
-    await robot.set_lights_rgb(255, 0, 0); await robot.set_wheel_speeds(-10, -10)
-    await asyncio.sleep(4.0); await robot.set_wheel_speeds(0, 0); await asyncio.sleep(0.5)
+    await robot.set_lights_rgb(255, 0, 0);
+    await robot.set_wheel_speeds(-10, -10)
+    await asyncio.sleep(4.0);
+    await robot.set_wheel_speeds(0, 0);
+    await asyncio.sleep(0.5)
     x_target, y_target, _ = PUNTOS_INTERES["Pasillo Inicio"]
     x, y, heading = await get_pos(robot)
     if x is not None:
@@ -266,25 +345,50 @@ async def iniciar_navegacion(robot):
     print(f"✅ Camino inicial: {' → '.join(camino_inicial)}")
     exito, punto_actual = await recorrer_camino_suave(robot, camino_inicial, punto_actual)
     if not exito: print(f"⚠ Fallo en recorrido inicial. Último punto: {punto_actual}."); return
-    print(f"\n🎉 ¡Llegada a la zona de *{punto_actual}*! Esperando instrucciones.")
+    print(f"\n🎉 ¡Llegada a la zona de *{punto_actual}*! Preparado para recibir órdenes de voz.")
     await robot.play_note(Note.A4, 0.5)
+
+    # Bucle principal que ahora escucha comandos de voz.
     while True:
-        destino_nombre = mostrar_menu()
-        if destino_nombre is None: print("Guía finalizado."); break
-        if destino_nombre == punto_actual: await robot.play_note(Note.C3, 0.3); continue
+        # Ejecutamos la función de escucha en un hilo separado para no bloquear asyncio
+        destino_nombre = await asyncio.to_thread(_escuchar_y_procesar_comando)
+
+        if destino_nombre is None:
+            # Si no se entendió, no se dijo nada, o es un destino inválido, volvemos a escuchar.
+            await robot.play_note(Note.C3, 0.3)
+            continue
+
+        if destino_nombre == "SALIR":
+            print("Guía finalizado. ¡Hasta pronto!")
+            break
+
+        if destino_nombre == punto_actual:
+            print("Ya estamos en ese destino.")
+            await robot.play_note(Note.C4, 0.3)
+            continue
+
         print(f"\nCalculando camino de *{punto_actual}* a *{destino_nombre}*...")
         camino = dijkstra(GRAFO, punto_actual, destino_nombre)
-        if not camino: print("ERROR: No se encontró camino."); continue
+        if not camino:
+            print(f"ERROR: No se encontró un camino a {destino_nombre}.")
+            await robot.play_note(Note.C2, 1.0)
+            continue
+
         print(f"✅ Camino encontrado: {' → '.join(camino)}")
         await robot.set_lights_rgb(0, 0, 255)
         exito, punto_actual = await recorrer_camino_suave(robot, camino, punto_actual)
+
         if exito:
             print(f"\n🎉 ¡Llegada exitosa a *{punto_actual}*!")
-            await robot.set_lights_rgb(0, 255, 0); await robot.play_note(Note.G5, 0.5)
+            await robot.set_lights_rgb(0, 255, 0);
+            await robot.play_note(Note.G5, 0.5)
         else:
-            print(f"⚠ Fallo en la navegación. Último punto: {punto_actual}.")
-            await robot.set_lights_rgb(255, 0, 0); await robot.play_note(Note.C2, 0.5)
-        await asyncio.sleep(2.0)
+            print(f"⚠ Fallo en la navegación. Último punto cercano: {punto_actual}.")
+            await robot.set_lights_rgb(255, 0, 0);
+            await robot.play_note(Note.C2, 0.5)
+
+        await asyncio.sleep(1.0)  # Pequeña pausa antes de volver a escuchar
+
 
 @event(robot.when_play)
 async def play(robot):
@@ -292,5 +396,6 @@ async def play(robot):
     await robot.set_lights_rgb(255, 192, 203)
     await asyncio.sleep(1.0)
     await iniciar_navegacion(robot)
+
 
 robot.play()
